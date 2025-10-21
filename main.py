@@ -252,9 +252,6 @@ async def fetch_trends_via_serpapi(keyword: str, region: str, timeframe: str) ->
     base = {
         "engine": "google_trends",
         "q": keyword,
-        # SerpAPI error showed: Unsupported `en-US` interface language.
-        # Use plain 'en' which is accepted by the google_trends engine.
-        "hl": "en",
         "date": win,
         "api_key": SERPAPI_KEY,
     }
@@ -262,37 +259,53 @@ async def fetch_trends_via_serpapi(keyword: str, region: str, timeframe: str) ->
         base["geo"] = region
 
     async def do_req(params: dict) -> tuple[int, dict | None, str]:
-        try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT}) as client:
-                r = await client.get("https://serpapi.com/search.json", params=params)
-                txt = r.text[:400]
-                try:
-                    js = r.json()
-                except Exception:
-                    js = None
-                return r.status_code, js, txt
-        except Exception as e:
-            return 599, None, str(e)
+        last_code = 599
+        last_js = None
+        last_txt = ""
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT}) as client:
+                    r = await client.get("https://serpapi.com/search.json", params=params)
+                    txt = r.text[:400]
+                    try:
+                        js = r.json()
+                    except Exception:
+                        js = None
+                    return r.status_code, js, txt
+            except Exception as e:
+                last_txt = str(e)
+                last_code = 599
+                # small backoff before retrying network errors
+                await asyncio.sleep(0.8 * (attempt + 1))
+                continue
+        return last_code, last_js, last_txt
 
-    # Attempt A: include data_type=TIMESERIES
-    params_a = {**base, "data_type": "TIMESERIES"}
+    # Attempt A: include data_type=TIMESERIES and hl=en explicitly
+    params_a = {**base, "data_type": "TIMESERIES", "hl": "en"}
     code, js, txt = await do_req(params_a)
     print(f"📊 SerpAPI A (TIMESERIES) code={code} for '{keyword}' date={base['date']} geo={base.get('geo','')}")
-    print(f"    using hl={base.get('hl')}")
 
-    # Attempt B: if 400, retry without data_type
-    if code == 400:
-        print(f"ℹ️ 400 on TIMESERIES; retrying without data_type. Body: {txt}")
-        params_b = dict(base)
+    # Attempt B: if 400/422/599, drop hl but keep TIMESERIES
+    if code in (400, 422, 599):
+        print(f"ℹ️ A failed ({code}); retrying without hl but with TIMESERIES. Body: {txt}")
+        params_b = {**base, "data_type": "TIMESERIES"}
         code, js, txt = await do_req(params_b)
-        print(f"📊 SerpAPI B (no data_type) code={code} for '{keyword}'")
+        print(f"📊 SerpAPI B (TIMESERIES no hl) code={code} for '{keyword}'")
 
-        # Attempt C: if still 400, standardize date to 'today 12-m'
-        if code == 400:
-            params_c = dict(params_b)
-            params_c["date"] = "today 12-m"
-            code, js, txt = await do_req(params_c)
-            print(f"📊 SerpAPI C (no data_type, today 12-m) code={code} for '{keyword}'")
+    # Attempt C: if still failing, drop data_type too
+    if code in (400, 422, 599):
+        print(f"ℹ️ B failed ({code}); retrying without data_type and without hl")
+        params_c = dict(base)
+        code, js, txt = await do_req(params_c)
+        print(f"📊 SerpAPI C (no data_type/no hl) code={code} for '{keyword}'")
+
+    # Attempt D: as a last resort, force date to 'today 12-m' and no hl/data_type
+    if code in (400, 422, 599):
+        print(f"ℹ️ C failed ({code}); forcing date='today 12-m'")
+        params_d = dict(base)
+        params_d["date"] = "today 12-m"
+        code, js, txt = await do_req(params_d)
+        print(f"📊 SerpAPI D (today 12-m) code={code} for '{keyword}'")
 
     if code != 200 or not isinstance(js, dict):
         print(f"❌ SerpAPI trends failed: code={code} body={txt}")
