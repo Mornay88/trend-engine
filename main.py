@@ -252,7 +252,9 @@ async def fetch_trends_via_serpapi(keyword: str, region: str, timeframe: str) ->
     base = {
         "engine": "google_trends",
         "q": keyword,
-        "hl": "en-US",
+        # SerpAPI error showed: Unsupported `en-US` interface language.
+        # Use plain 'en' which is accepted by the google_trends engine.
+        "hl": "en",
         "date": win,
         "api_key": SERPAPI_KEY,
     }
@@ -276,6 +278,7 @@ async def fetch_trends_via_serpapi(keyword: str, region: str, timeframe: str) ->
     params_a = {**base, "data_type": "TIMESERIES"}
     code, js, txt = await do_req(params_a)
     print(f"📊 SerpAPI A (TIMESERIES) code={code} for '{keyword}' date={base['date']} geo={base.get('geo','')}")
+    print(f"    using hl={base.get('hl')}")
 
     # Attempt B: if 400, retry without data_type
     if code == 400:
