@@ -30,6 +30,8 @@ DEFAULT_REGION = os.environ.get("DEFAULT_REGION", "worldwide")
 DEFAULT_TIMEFRAME = os.environ.get("DEFAULT_TIMEFRAME", "today 5-y")
 HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "30"))
 PYTRENDS_DELAY_SEC = float(os.environ.get("PYTRENDS_DELAY_SEC", "2.0"))
+# Allow forcing SerpAPI for demand (for debugging/fallback)
+FORCE_SERPAPI_TRENDS = (os.environ.get("FORCE_SERPAPI_TRENDS", "false").strip().lower() in ("1","true","yes"))
 USER_AGENT = os.environ.get(
     "USER_AGENT",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -222,18 +224,25 @@ def fetch_trends(keyword: str, region: str, timeframe: str) -> Dict[str, Any]:
 async def fetch_trends_via_serpapi(keyword: str, region: str, timeframe: str) -> Dict[str, Any]:
     """
     Fallback Trends fetch via SerpAPI if direct PyTrends fails/returns empty.
+    Uses SerpAPI's google_trends engine and parses interest_over_time.timeline_data.
     """
     if not SERPAPI_KEY:
         return {"current": 0, "momentum_pct": 0.0, "series": [], "rising_queries": []}
 
-    # Map 'today X-y' to SerpAPI's expected windows
-    win = "12m"
-    if "5-y" in timeframe:
-        win = "5y"
-    elif "3-m" in timeframe:
-        win = "3m"
-    elif "7-d" in timeframe:
-        win = "7d"
+    # Normalize timeframe to values SerpAPI accepts (e.g., "today 5-y", "today 12-m", "now 7-d")
+    tf = (timeframe or "").strip().lower()
+    if tf.startswith("today ") or tf.startswith("now "):
+        win = timeframe
+    elif "5-y" in tf:
+        win = "today 5-y"
+    elif "12-m" in tf or "1-y" in tf:
+        win = "today 12-m"
+    elif "3-m" in tf:
+        win = "today 3-m"
+    elif "7-d" in tf:
+        win = "now 7-d"
+    else:
+        win = "today 12-m"
 
     params = {
         "engine": "google_trends",
@@ -249,29 +258,32 @@ async def fetch_trends_via_serpapi(keyword: str, region: str, timeframe: str) ->
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT}) as client:
             r = await client.get("https://serpapi.com/search.json", params=params)
             if r.status_code != 200:
+                print(f"SerpAPI trends HTTP {r.status_code} for {keyword}")
                 return {"current": 0, "momentum_pct": 0.0, "series": [], "rising_queries": []}
             j = r.json()
 
-            # Parse time series
-            points = j.get("interest_over_time", []) or j.get("timeline", [])
-            series = []
-            vals = []
+            # SerpAPI schema: interest_over_time.timeline_data -> list of {date|formattedTime, values: [{value:int}]}
+            iot = j.get("interest_over_time") or {}
+            points = iot.get("timeline_data") or []
+            series: List[Dict[str, Any]] = []
+            vals: List[int] = []
             for p in points:
                 t = p.get("date") or p.get("formattedTime")
-                v_raw = p.get("value")
-                if isinstance(v_raw, list) and v_raw:
-                    v = v_raw[0]
-                else:
-                    v = v_raw or 0
-                v = int(v or 0)
+                v_obj = (p.get("values") or [{}])[0]
+                v = v_obj.get("value", 0)
+                if isinstance(v, list):
+                    v = (v[0] if v else 0)
+                try:
+                    v = int(v or 0)
+                except Exception:
+                    v = 0
                 series.append({"t": str(t), "v": v})
                 vals.append(v)
 
             current = int(vals[-1]) if vals else 0
 
-            # Momentum: last 90 vs previous 90 (or 30 vs previous 30 if shorter)
-            def avg(lst):
-                return sum(lst) / len(lst) if lst else 0
+            # Momentum: last 90 vs previous 90 (or 30 vs previous 30)
+            def avg(lst): return sum(lst) / len(lst) if lst else 0
             if len(vals) >= 180:
                 last = avg(vals[-90:])
                 prev = avg(vals[-180:-90])
@@ -282,8 +294,8 @@ async def fetch_trends_via_serpapi(keyword: str, region: str, timeframe: str) ->
                 last = prev = 0
             mom = ((last - prev) / prev * 100.0) if prev > 0 else 0.0
 
-            # Rising queries
-            rq = j.get("rising_queries", {}).get("rising", []) or []
+            # Rising queries (if present)
+            rq = (j.get("rising_queries") or {}).get("rising") or []
             rising = [str(x.get("query")) for x in rq[:5] if x.get("query")]
 
             return {
@@ -292,7 +304,8 @@ async def fetch_trends_via_serpapi(keyword: str, region: str, timeframe: str) ->
                 "series": series,
                 "rising_queries": rising,
             }
-    except Exception:
+    except Exception as e:
+        print(f"SerpAPI trends exception for {keyword}: {e}")
         return {"current": 0, "momentum_pct": 0.0, "series": [], "rising_queries": []}
 
 # ----------------- Supply: Spocket & Zendrop (public mirrors) -----------------
@@ -493,10 +506,13 @@ async def analyze(body: AnalyzeBody):
     # Demand (Google Trends) — serial is fine; pytrends doesn't love many threads
     demand_map: Dict[str, Dict[str, Any]] = {}
     for kw in keywords:
-        d = fetch_trends(kw, region, timeframe)
-        # Fallback to SerpAPI Trends if PyTrends returned empty and a key is present
-        if SERPAPI_KEY and (not d.get("series")):
+        if FORCE_SERPAPI_TRENDS and SERPAPI_KEY:
             d = await fetch_trends_via_serpapi(kw, region, timeframe)
+        else:
+            d = fetch_trends(kw, region, timeframe)
+            # Fallback to SerpAPI Trends if PyTrends returned empty and a key is present
+            if SERPAPI_KEY and (not d.get("series")):
+                d = await fetch_trends_via_serpapi(kw, region, timeframe)
         demand_map[kw] = d
         time.sleep(PYTRENDS_DELAY_SEC)  # configurable delay
 
