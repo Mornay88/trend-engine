@@ -43,6 +43,23 @@ USER_AGENT = os.environ.get(
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
+# ---- SerpAPI timeframe mapping ----
+def _serpapi_date_from_timeframe(tf: str) -> str:
+    tf = (tf or "").strip().lower()
+    if tf.startswith("today ") or tf.startswith("now "):
+        return tf
+    if "5-y" in tf:
+        return "today 5-y"
+    if "12-m" in tf or "1-y" in tf:
+        return "today 12-m"
+    if "3-m" in tf:
+        return "today 3-m"
+    if "1-m" in tf:
+        return "today 1-m"
+    if "7-d" in tf or "now 7" in tf:
+        return "now 7-d"
+    return "today 12-m"
+
 # Simple in-memory cache (process local)
 CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL_SEC = 24 * 60 * 60  # 24h
@@ -227,7 +244,108 @@ def fetch_trends(keyword: str, region: str, timeframe: str) -> Dict[str, Any]:
         return default_out
 
 
-async def fetch_trends_via_serpapi(keyword: str, region: str, timeframe: str) -> Dict[str, Any]:
+
+async def fetch_trends_via_serpapi_retry(keyword: str, region: str, timeframe: str) -> Dict[str, Any]:
+    """
+    Try SerpAPI Trends with A/B/C patterns and print logs like earlier:
+      A) TIMESERIES + hl=en
+      B) TIMESERIES (no hl)
+      C) No data_type, no hl
+    """
+    empty = {"current": 0, "momentum_pct": 0.0, "series": [], "rising_queries": []}
+    if not SERPAPI_KEY:
+        return empty
+
+    date_str = _serpapi_date_from_timeframe(timeframe)
+    geo = "" if not region or region.lower() in ("", "worldwide") else region
+
+    async def _try(params: dict, tag: str) -> Optional[Dict[str, Any]]:
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT}) as client:
+                r = await client.get("https://serpapi.com/search.json", params=params)
+                print(f"📊 SerpAPI {tag} code={r.status_code} for '{keyword}' date={params.get('date')} geo={params.get('geo','')}")
+                if r.status_code != 200:
+                    body = (r.text or "")[:400]
+                    hint = "retrying without hl" if tag.startswith("A") else ("retrying without data_type and without hl" if tag.startswith("B") else "giving up")
+                    print(f"ℹ️ {tag.split()[0]} failed ({r.status_code}); {hint}. Body: {body}")
+                    return None
+                j = r.json()
+                iot = j.get("interest_over_time", {}) or {}
+                points = iot.get("timeline_data", []) or iot.get("timelineData", []) or []
+                if not points:
+                    print(f"⚠️ Empty timeline data for '{keyword}' on {tag}")
+                    return None
+
+                series, vals = [], []
+                for p in points:
+                    t = p.get("date") or p.get("formattedTime") or ""
+                    vs = p.get("values") or p.get("value") or []
+                    v = 0
+                    if isinstance(vs, list) and vs:
+                        v0 = vs[0]
+                        if isinstance(v0, dict):
+                            v_raw = v0.get("value") or v0.get("extracted_value") or 0
+                        else:
+                            v_raw = v0
+                        if isinstance(v_raw, str):
+                            v = 0 if "<" in v_raw else (int(v_raw) if v_raw.isdigit() else 0)
+                        else:
+                            v = int(v_raw or 0)
+                    series.append({"t": str(t), "v": v})
+                    vals.append(v)
+
+                def avg(lst):
+                    return sum(lst) / len(lst) if lst else 0
+                if len(vals) >= 180:
+                    last, prev = avg(vals[-90:]), avg(vals[-180:-90])
+                elif len(vals) >= 60:
+                    last, prev = avg(vals[-30:]), avg(vals[-60:-30])
+                else:
+                    last = avg(vals[-14:]) if len(vals) >= 28 else avg(vals)
+                    prev = avg(vals[-28:-14]) if len(vals) >= 28 else 0
+                mom = ((last - prev) / prev * 100.0) if prev > 0 else 0.0
+
+                print(f"✅ SerpAPI trends OK for '{keyword}': points={len(series)} current={vals[-1] if vals else 0}")
+                return {
+                    "current": int(vals[-1]) if vals else 0,
+                    "momentum_pct": float(round(mom, 2)),
+                    "series": series,
+                    "rising_queries": [],
+                }
+        except Exception as e:
+            print(f"❌ SerpAPI trends exception on {tag} for '{keyword}': {e}")
+            return None
+
+    # A) TIMESERIES + hl
+    params_a = {
+        "engine": "google_trends",
+        "q": keyword,
+        "data_type": "TIMESERIES",
+        "hl": "en",
+        "date": date_str,
+        "api_key": SERPAPI_KEY,
+    }
+    if geo:
+        params_a["geo"] = geo
+    res = await _try(params_a, "A (TIMESERIES)")
+    if res:
+        return res
+
+    # B) TIMESERIES without hl
+    params_b = dict(params_a)
+    params_b.pop("hl", None)
+    res = await _try(params_b, "B (TIMESERIES no hl)")
+    if res:
+        return res
+
+    # C) No data_type and no hl
+    params_c = {k: v for k, v in params_a.items() if k not in ("data_type", "hl")}
+    res = await _try(params_c, "C (no data_type/no hl)")
+    if res:
+        return res
+
+    print(f"❌ SerpAPI trends failed after A/B/C for '{keyword}'")
+    return empty
     """
     SerpAPI fallback for Google Trends with reduced noise and quick retries.
     Attempt order (fastest → most permissive):
@@ -537,18 +655,19 @@ async def analyze(body: AnalyzeBody):
     region = body.options.region
     timeframe = body.options.timeframe
 
-    # Demand (Google Trends) — serial is fine; pytrends doesn't love many threads
+    # Demand (Google Trends)
     demand_map: Dict[str, Dict[str, Any]] = {}
     for kw in keywords:
-        if FORCE_SERPAPI_TRENDS and SERPAPI_KEY:
-            d = await fetch_trends_via_serpapi(kw, region, timeframe)
+        if body.options.include_supply and SERPAPI_KEY:
+            # Deep Mode: force SerpAPI A/B/C pattern and logs
+            d = await fetch_trends_via_serpapi_retry(kw, region, timeframe)
         else:
+            # Fast Mode: try PyTrends first, fallback to SerpAPI if empty
             d = fetch_trends(kw, region, timeframe)
-            # Fallback to SerpAPI Trends if PyTrends returned empty and a key is present
             if SERPAPI_KEY and (not d.get("series")):
-                d = await fetch_trends_via_serpapi(kw, region, timeframe)
+                d = await fetch_trends_via_serpapi_retry(kw, region, timeframe)
         demand_map[kw] = d
-        time.sleep(PYTRENDS_DELAY_SEC)  # configurable delay
+        time.sleep(PYTRENDS_DELAY_SEC if not body.options.include_supply else 0.2)
 
     # Supply (Spocket/Zendrop + SERP proxies) — async for speed
     supply_map: Dict[str, Dict[str, Any]] = {}
