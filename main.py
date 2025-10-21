@@ -224,66 +224,101 @@ def fetch_trends(keyword: str, region: str, timeframe: str) -> Dict[str, Any]:
 async def fetch_trends_via_serpapi(keyword: str, region: str, timeframe: str) -> Dict[str, Any]:
     """
     Fallback Trends fetch via SerpAPI if direct PyTrends fails/returns empty.
-    Uses SerpAPI's google_trends engine and parses interest_over_time.timeline_data.
+    Uses SerpAPI's google_trends engine.
     """
     if not SERPAPI_KEY:
+        print(f"⚠️ SerpAPI key not set, skipping trends for '{keyword}'")
         return {"current": 0, "momentum_pct": 0.0, "series": [], "rising_queries": []}
 
-    # Normalize timeframe to values SerpAPI accepts (e.g., "today 5-y", "today 12-m", "now 7-d")
+    # Normalize timeframe to SerpAPI format
     tf = (timeframe or "").strip().lower()
-    if tf.startswith("today ") or tf.startswith("now "):
-        win = timeframe
-    elif "5-y" in tf:
+    if "5-y" in tf:
         win = "today 5-y"
     elif "12-m" in tf or "1-y" in tf:
         win = "today 12-m"
     elif "3-m" in tf:
         win = "today 3-m"
-    elif "7-d" in tf:
+    elif "1-m" in tf:
+        win = "today 1-m"
+    elif "7-d" in tf or "now 7" in tf:
         win = "now 7-d"
     else:
-        win = "today 12-m"
+        win = "today 12-m"  # default
+
+    print(f"🔍 Fetching SerpAPI trends for '{keyword}' (region={region or 'worldwide'}, date={win})")
 
     params = {
         "engine": "google_trends",
         "q": keyword,
-        "data_type": "TIMESERIES",
         "hl": "en-US",
-        "geo": "" if region.lower() == "worldwide" else region,
+        "tz": "-360",  # UTC-6, adjust as needed or use str(PYTRENDS_TZ)
         "date": win,
         "api_key": SERPAPI_KEY,
     }
+    
+    # Add geo only if not worldwide
+    if region and region.lower() not in ("", "worldwide"):
+        params["geo"] = region
 
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT}) as client:
             r = await client.get("https://serpapi.com/search.json", params=params)
+            print(f"📊 SerpAPI HTTP {r.status_code} for '{keyword}'")
+            
             if r.status_code != 200:
-                print(f"SerpAPI trends HTTP {r.status_code} for {keyword}")
+                print(f"❌ SerpAPI error: {r.text[:300]}")
                 return {"current": 0, "momentum_pct": 0.0, "series": [], "rising_queries": []}
+            
             j = r.json()
-
-            # SerpAPI schema: interest_over_time.timeline_data -> list of {date|formattedTime, values: [{value:int}]}
-            iot = j.get("interest_over_time") or {}
-            points = iot.get("timeline_data") or []
+            
+            # SerpAPI Google Trends returns: interest_over_time.timeline_data
+            iot = j.get("interest_over_time", {})
+            points = iot.get("timeline_data", [])
+            
+            print(f"📈 Found {len(points)} data points for '{keyword}'")
+            
+            if not points:
+                print(f"⚠️ Empty timeline data for '{keyword}'")
+                return {"current": 0, "momentum_pct": 0.0, "series": [], "rising_queries": []}
+            
+            # Parse timeline data
             series: List[Dict[str, Any]] = []
             vals: List[int] = []
+            
             for p in points:
-                t = p.get("date") or p.get("formattedTime")
-                v_obj = (p.get("values") or [{}])[0]
-                v = v_obj.get("value", 0)
-                if isinstance(v, list):
-                    v = (v[0] if v else 0)
-                try:
-                    v = int(v or 0)
-                except Exception:
+                # Date can be in 'date' or 'formattedTime' field
+                date_str = p.get("date") or p.get("formattedTime", "")
+                
+                # Value is in values array, first element
+                values_arr = p.get("values", [])
+                if values_arr and len(values_arr) > 0:
+                    val_obj = values_arr[0]
+                    # Sometimes it's 'value', sometimes 'extracted_value'
+                    v = val_obj.get("value") or val_obj.get("extracted_value", 0)
+                    
+                    # Handle "<1" strings (means less than 1)
+                    if isinstance(v, str):
+                        if "<" in v:
+                            v = 0
+                        else:
+                            try:
+                                v = int(v)
+                            except:
+                                v = 0
+                    else:
+                        v = int(v) if v else 0
+                else:
                     v = 0
-                series.append({"t": str(t), "v": v})
+                
+                series.append({"t": date_str, "v": v})
                 vals.append(v)
-
+            
             current = int(vals[-1]) if vals else 0
-
-            # Momentum: last 90 vs previous 90 (or 30 vs previous 30)
-            def avg(lst): return sum(lst) / len(lst) if lst else 0
+            
+            # Calculate momentum
+            def avg(lst): 
+                return sum(lst) / len(lst) if lst else 0
+            
             if len(vals) >= 180:
                 last = avg(vals[-90:])
                 prev = avg(vals[-180:-90])
@@ -291,21 +326,33 @@ async def fetch_trends_via_serpapi(keyword: str, region: str, timeframe: str) ->
                 last = avg(vals[-30:])
                 prev = avg(vals[-60:-30])
             else:
-                last = prev = 0
+                last = avg(vals[-14:]) if len(vals) >= 28 else avg(vals)
+                prev = avg(vals[-28:-14]) if len(vals) >= 28 else 0
+            
             mom = ((last - prev) / prev * 100.0) if prev > 0 else 0.0
-
-            # Rising queries (if present)
-            rq = (j.get("rising_queries") or {}).get("rising") or []
-            rising = [str(x.get("query")) for x in rq[:5] if x.get("query")]
-
+            
+            # Rising queries
+            rising_list = []
+            related = j.get("related_queries", {})
+            rising_data = related.get("rising", [])
+            for item in rising_data[:5]:
+                query = item.get("query", "")
+                if query:
+                    rising_list.append(query)
+            
+            print(f"✅ SerpAPI success: '{keyword}' current={current}, momentum={mom:.1f}%, points={len(series)}")
+            
             return {
                 "current": current,
                 "momentum_pct": float(round(mom, 2)),
                 "series": series,
-                "rising_queries": rising,
+                "rising_queries": rising_list,
             }
+            
     except Exception as e:
-        print(f"SerpAPI trends exception for {keyword}: {e}")
+        print(f"❌ SerpAPI exception for '{keyword}': {e}")
+        import traceback
+        traceback.print_exc()
         return {"current": 0, "momentum_pct": 0.0, "series": [], "rising_queries": []}
 
 # ----------------- Supply: Spocket & Zendrop (public mirrors) -----------------
