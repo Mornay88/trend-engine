@@ -10,6 +10,7 @@ import time
 import re
 import asyncio
 import hashlib
+import json
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 
@@ -21,6 +22,7 @@ import pandas as pd
 from pytrends.request import TrendReq
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from openai import OpenAI
 
 # ----------------- Config -----------------
 SCRAPER_API_URL = (os.environ.get("SCRAPER_API_URL") or "").strip()
@@ -42,6 +44,9 @@ USER_AGENT = os.environ.get(
     "USER_AGENT",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 
 # ---- SerpAPI timeframe mapping ----
 def _serpapi_date_from_timeframe(tf: str) -> str:
@@ -645,7 +650,154 @@ app.add_middleware(
 def health():
     return {"ok": True, "time": datetime.utcnow().isoformat() + "Z"}
 
+class ExplainBody(BaseModel):
+    keyword: str
+    demand: Dict[str, Any]
+    supply: Dict[str, Any]
+    scores: Dict[str, Any]
+    tone: Optional[str] = "friendly"
+    audience: Optional[str] = "beginner"
 
+
+from fastapi import FastAPI, HTTPException, Request  # make sure Request is imported
+
+@app.post("/explain")
+async def explain(body: ExplainBody, request: Request):
+    # Build cache key
+    ck = make_cache_key(
+        "explain",
+        body.keyword,
+        json.dumps(body.demand, sort_keys=True),
+        json.dumps(body.supply, sort_keys=True),
+        json.dumps(body.scores, sort_keys=True),
+        body.tone, body.audience
+    )
+
+    # Allow cache bypass via header for billing/diagnostics
+    bypass_cache = request.headers.get("x-bypass-cache") == "1"
+    if not bypass_cache:
+        hit = cache_get(ck)
+        if hit:
+            return {"explanation": hit, "source": "cache"}
+
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="LLM not configured (OPENAI_API_KEY missing)")
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    print("Using OpenAI base URL:", getattr(client, "base_url", "<unknown>"))
+
+    model = (OPENAI_MODEL or "gpt-5-mini").strip()
+    is_gpt5 = model.startswith("gpt-5")
+
+    system_msg = (
+        "You are a helpful ecommerce analyst. "
+        "Write 2–4 short sentences in plain language (<=60 words). "
+        "Include exactly one concrete next step. Do not reveal chain-of-thought."
+    )
+    data_dict = {
+        "keyword": body.keyword,
+        "demand": body.demand,
+        "supply": body.supply,
+        "scores": body.scores,
+    }
+    user_prompt = (
+        "Explain this product opportunity for a {aud} in a {tone} tone.\n\nDATA:\n{data}"
+    ).format(
+        aud=body.audience or "beginner",
+        tone=body.tone or "friendly",
+        data=json.dumps(data_dict, indent=2),
+    )
+
+    def extract_text(resp):
+        try:
+            return (resp.choices[0].message.content or "").strip()
+        except Exception:
+            return ""
+
+    def extract_usage(resp):
+        try:
+            u = getattr(resp, "usage", None)
+            if not u:
+                return None
+            return {
+                "prompt_tokens": getattr(u, "prompt_tokens", None),
+                "completion_tokens": getattr(u, "completion_tokens", None),
+                "total_tokens": getattr(u, "total_tokens", None),
+            }
+        except Exception:
+            return None
+
+    try:
+        text = ""
+        usage = None
+
+        if is_gpt5:
+            # GPT-5 mini: ONLY send max_completion_tokens (no temperature/top_p/penalties)
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user",  "content": user_prompt},
+                ],
+                max_completion_tokens=256,
+            )
+            text = extract_text(resp)
+            usage = extract_usage(resp)
+
+            # If empty or length-stopped, try once more with a bit more room
+            if not text or (resp.choices and resp.choices[0].finish_reason == "length"):
+                resp2 = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user",  "content": user_prompt},
+                    ],
+                    max_completion_tokens=384,
+                )
+                text = extract_text(resp2)
+                usage = extract_usage(resp2)
+
+        else:
+            # Non-reasoning models (e.g., gpt-4o-mini)
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user",  "content": user_prompt},
+                ],
+                max_tokens=240,
+                temperature=0.2,
+            )
+            text = extract_text(resp)
+            usage = extract_usage(resp)
+
+        # Fallback to a non-reasoning model if still empty
+        if not text:
+            fallback_model = os.environ.get("OPENAI_FALLBACK_MODEL", "gpt-4o-mini")
+            resp3 = client.chat.completions.create(
+                model=fallback_model,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user",  "content": user_prompt},
+                ],
+                max_tokens=240,
+                temperature=0.2,
+            )
+            text = extract_text(resp3)
+            usage = extract_usage(resp3)
+
+        if not text:
+            raise HTTPException(status_code=502, detail="LLM returned empty response")
+
+        cache_set(ck, text)
+        return {"explanation": text, "source": "llm", "usage": usage}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"LLM error for keyword '{body.keyword}': {e}")
+        raise HTTPException(status_code=502, detail=f"LLM error: {e}")
+    
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(body: AnalyzeBody):
     keywords = [k.strip() for k in body.keywords if k and k.strip()]
@@ -667,7 +819,7 @@ async def analyze(body: AnalyzeBody):
             if SERPAPI_KEY and (not d.get("series")):
                 d = await fetch_trends_via_serpapi_retry(kw, region, timeframe)
         demand_map[kw] = d
-        time.sleep(PYTRENDS_DELAY_SEC if not body.options.include_supply else 0.2)
+        await asyncio.sleep(PYTRENDS_DELAY_SEC if not body.options.include_supply else 0.2)
 
     # Supply (Spocket/Zendrop + SERP proxies) — async for speed
     supply_map: Dict[str, Dict[str, Any]] = {}
