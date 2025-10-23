@@ -270,9 +270,11 @@ async def fetch_trends_via_serpapi_retry(keyword: str, region: str, timeframe: s
                 r = await client.get("https://serpapi.com/search.json", params=params)
                 print(f"📊 SerpAPI {tag} code={r.status_code} for '{keyword}' date={params.get('date')} geo={params.get('geo','')}")
                 if r.status_code != 200:
-                    body = (r.text or "")[:400]
-                    hint = "retrying without hl" if tag.startswith("A") else ("retrying without data_type and without hl" if tag.startswith("B") else "giving up")
-                    print(f"ℹ️ {tag.split()[0]} failed ({r.status_code}); {hint}. Body: {body}")
+                    body = (r.text or "")[:300]
+                    print(
+                        f"ℹ️ {tag}: SerpAPI non-200 for '{keyword}' "
+                        f"code={r.status_code} params={{date:{params.get('date')}, geo:{params.get('geo')}}} body={body}"
+                    )
                     return None
                 j = r.json()
                 iot = j.get("interest_over_time", {}) or {}
@@ -318,7 +320,10 @@ async def fetch_trends_via_serpapi_retry(keyword: str, region: str, timeframe: s
                     "rising_queries": [],
                 }
         except Exception as e:
-            print(f"❌ SerpAPI trends exception on {tag} for '{keyword}': {e}")
+            print(
+                f"❌ SerpAPI trends exception on {tag} for '{keyword}': {repr(e)} "
+                f"params={{date:{params.get('date')}, geo:{params.get('geo')}}}"
+            )
             return None
 
     # A) TIMESERIES + hl
@@ -349,8 +354,8 @@ async def fetch_trends_via_serpapi_retry(keyword: str, region: str, timeframe: s
     if res:
         return res
 
-    print(f"❌ SerpAPI trends failed after A/B/C for '{keyword}'")
-    return empty
+    print(f"❌ SerpAPI trends failed after A/B/C for '{keyword}' — falling back to PyTrends")
+    return fetch_trends(keyword, region, timeframe)
 
 # ----------------- Supply: Spocket & Zendrop (public mirrors) -----------------
 CARD_RE = re.compile(
@@ -719,7 +724,7 @@ async def analyze(body: AnalyzeBody):
             if SERPAPI_KEY and (not d.get("series")):
                 d = await fetch_trends_via_serpapi_retry(kw, region, timeframe)
         demand_map[kw] = d
-        time.sleep(PYTRENDS_DELAY_SEC if not body.options.include_supply else 0.2)
+        await asyncio.sleep(PYTRENDS_DELAY_SEC if not body.options.include_supply else 0.2)
 
     # Supply (Spocket/Zendrop + SERP proxies) — async for speed
     supply_map: Dict[str, Dict[str, Any]] = {}
