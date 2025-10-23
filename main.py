@@ -351,119 +351,6 @@ async def fetch_trends_via_serpapi_retry(keyword: str, region: str, timeframe: s
 
     print(f"❌ SerpAPI trends failed after A/B/C for '{keyword}'")
     return empty
-    """
-    SerpAPI fallback for Google Trends with reduced noise and quick retries.
-    Attempt order (fastest → most permissive):
-      1) Minimal params (no hl, no data_type)
-      2) Add data_type=TIMESERIES
-      3) Add hl=en
-    """
-    def empty():
-        return {"current": 0, "momentum_pct": 0.0, "series": [], "rising_queries": []}
-
-    if not SERPAPI_KEY:
-        log(f"SerpAPI disabled; no key for '{keyword}'")
-        return empty()
-
-    # Normalize timeframe for SerpAPI
-    tf = (timeframe or "").strip().lower()
-    if tf.startswith("today ") or tf.startswith("now "):
-        win = timeframe
-    elif "5-y" in tf:
-        win = "today 5-y"
-    elif "12-m" in tf or "1-y" in tf:
-        win = "today 12-m"
-    elif "3-m" in tf:
-        win = "today 3-m"
-    elif "7-d" in tf:
-        win = "now 7-d"
-    else:
-        win = "today 12-m"
-
-    base = {
-        "engine": "google_trends",
-        "q": keyword,
-        "date": win,
-        "api_key": SERPAPI_KEY,
-    }
-    if region and region.lower() not in ("", "worldwide"):
-        base["geo"] = region
-
-    attempts = [
-        {**base},
-        {**base, "data_type": "TIMESERIES"},
-        {**base, "data_type": "TIMESERIES", "hl": "en"},
-    ]
-
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT}) as client:
-        for idx, params in enumerate(attempts, start=1):
-            for retry in range(2):  # brief retry for 599/5xx
-                try:
-                    r = await client.get("https://serpapi.com/search.json", params=params)
-                    code = r.status_code
-                    if code == 200:
-                        j = r.json()
-                        iot = j.get("interest_over_time") or {}
-                        pts = iot.get("timeline_data") or iot.get("timelineData") or []
-                        if not pts:
-                            log(f"SerpAPI {idx}: empty timeline for '{keyword}'")
-                            return empty()
-
-                        series: List[Dict[str, Any]] = []
-                        vals: List[int] = []
-                        for p in pts:
-                            t = p.get("date") or p.get("formattedTime") or ""
-                            values_arr = p.get("values") or p.get("value") or []
-                            if isinstance(values_arr, list) and values_arr:
-                                v_raw = values_arr[0].get("value") if isinstance(values_arr[0], dict) else values_arr[0]
-                            else:
-                                v_raw = 0
-                            if isinstance(v_raw, str):
-                                v = 0 if "<" in v_raw else (int(v_raw) if v_raw.isdigit() else 0)
-                            else:
-                                v = int(v_raw or 0)
-                            series.append({"t": str(t), "v": v})
-                            vals.append(v)
-
-                        current = int(vals[-1]) if vals else 0
-                        def avg(x): return sum(x)/len(x) if x else 0
-                        if len(vals) >= 180:
-                            last, prev = avg(vals[-90:]), avg(vals[-180:-90])
-                        elif len(vals) >= 60:
-                            last, prev = avg(vals[-30:]), avg(vals[-60:-30])
-                        else:
-                            last = avg(vals[-14:]) if len(vals) >= 28 else avg(vals)
-                            prev = avg(vals[-28:-14]) if len(vals) >= 28 else 0
-                        mom = ((last - prev)/prev*100.0) if prev > 0 else 0.0
-
-                        rising_list: List[str] = []
-                        related = j.get("related_queries") or {}
-                        for item in (related.get("rising") or [])[:5]:
-                            q = item.get("query")
-                            if q:
-                                rising_list.append(str(q))
-
-                        log(f"SerpAPI OK for '{keyword}': points={len(series)} current={current}")
-                        return {
-                            "current": current,
-                            "momentum_pct": float(round(mom, 2)),
-                            "series": series,
-                            "rising_queries": rising_list,
-                        }
-
-                    if code >= 500 or code == 599:
-                        log(f"SerpAPI attempt {idx} retry {retry+1} code={code} for '{keyword}'")
-                        await asyncio.sleep(0.4)
-                        continue
-
-                    log(f"SerpAPI attempt {idx} failed code={code} for '{keyword}'")
-                    break  # try next param shape
-                except Exception as e:
-                    log(f"SerpAPI exception on attempt {idx} retry {retry+1} for '{keyword}': {e}")
-                    await asyncio.sleep(0.2)
-                    continue
-
-    return empty()
 
 # ----------------- Supply: Spocket & Zendrop (public mirrors) -----------------
 CARD_RE = re.compile(
@@ -832,7 +719,7 @@ async def analyze(body: AnalyzeBody):
             if SERPAPI_KEY and (not d.get("series")):
                 d = await fetch_trends_via_serpapi_retry(kw, region, timeframe)
         demand_map[kw] = d
-        await asyncio.sleep(PYTRENDS_DELAY_SEC if not body.options.include_supply else 0.2)
+        time.sleep(PYTRENDS_DELAY_SEC if not body.options.include_supply else 0.2)
 
     # Supply (Spocket/Zendrop + SERP proxies) — async for speed
     supply_map: Dict[str, Dict[str, Any]] = {}
