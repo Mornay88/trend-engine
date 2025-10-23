@@ -634,13 +634,23 @@ def compute_scores(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 # ----------------- FastAPI -----------------
+# ----------------- FastAPI -----------------
 app = FastAPI(title="Trend & Demand Data API", version="1.0.0")
 
-# CORS configuration
+# CORS configuration (env-driven)
+# Prefer ALLOWED_ORIGINS; fallback to CORS_ALLOW_ORIGINS; default to "*"
+_origins_env = os.environ.get("ALLOWED_ORIGINS") or os.environ.get("CORS_ALLOW_ORIGINS", "*")
+_origins_list = [o.strip() for o in _origins_env.split(",") if o.strip()]
+
+# If wildcard is used, disable credentials so ACAO will be set.
+_allow_credentials_env = os.environ.get("CORS_ALLOW_CREDENTIALS", "false").strip().lower() in ("1", "true", "yes")
+_use_wildcard = len(_origins_list) == 1 and _origins_list[0] == "*"
+_allow_credentials = False if _use_wildcard else _allow_credentials_env
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.environ.get("CORS_ALLOW_ORIGINS", "*").split(","),
-    allow_credentials=True,
+    allow_origins=["*"] if _use_wildcard else _origins_list,
+    allow_credentials=_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -659,7 +669,7 @@ class ExplainBody(BaseModel):
     audience: Optional[str] = "beginner"
 
 
-from fastapi import FastAPI, HTTPException, Request  # make sure Request is imported
+from fastapi import Request  # make sure Request is imported
 
 @app.post("/explain")
 async def explain(body: ExplainBody, request: Request):
