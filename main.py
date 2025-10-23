@@ -637,21 +637,24 @@ def compute_scores(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # ----------------- FastAPI -----------------
 app = FastAPI(title="Trend & Demand Data API", version="1.0.0")
 
-# CORS configuration (env-driven)
-# Prefer ALLOWED_ORIGINS; fallback to CORS_ALLOW_ORIGINS; default to "*"
-_origins_env = os.environ.get("ALLOWED_ORIGINS") or os.environ.get("CORS_ALLOW_ORIGINS", "*")
+# CORS configuration (env-driven, with Vercel preview support)
+# Accept explicit origins via ALLOWED_ORIGINS (comma-separated),
+# plus an optional regex via ALLOWED_ORIGIN_REGEX (e.g., r"https://.*\\.vercel\\.app$")
+_origins_env = os.environ.get("ALLOWED_ORIGINS", "")
 _origins_list = [o.strip() for o in _origins_env.split(",") if o.strip()]
-
-# If wildcard is used, disable credentials so ACAO will be set.
-_allow_credentials_env = os.environ.get("CORS_ALLOW_CREDENTIALS", "false").strip().lower() in ("1", "true", "yes")
-_use_wildcard = len(_origins_list) == 1 and _origins_list[0] == "*"
-_allow_credentials = False if _use_wildcard else _allow_credentials_env
-
+# Always include localhost:3000 for local dev unless explicitly disallowed
+if not any("localhost:3000" in o for o in _origins_list):
+    _origins_list.append("http://localhost:3000")
+# Default regex: allow any Vercel preview/prod domain
+_origin_regex = os.environ.get("ALLOWED_ORIGIN_REGEX", r"https://.*\.vercel\.app$")
+# If you truly want wildcard, set ALLOWED_ORIGIN_REGEX to ".*" and ALLOWED_ORIGINS to empty.
+# With regex, we can safely allow credentials.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if _use_wildcard else _origins_list,
-    allow_credentials=_allow_credentials,
-    allow_methods=["*"],
+    allow_origins=_origins_list,
+    allow_origin_regex=_origin_regex,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
