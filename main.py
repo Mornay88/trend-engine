@@ -48,6 +48,9 @@ USER_AGENT = os.environ.get(
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 
+# --- Seeds CSV config ---
+SEEDS_CSV_PATH = os.environ.get("SEEDS_CSV_PATH", "./data/seeds.csv").strip()
+
 # ---- SerpAPI timeframe mapping ----
 def _serpapi_date_from_timeframe(tf: str) -> str:
     tf = (tf or "").strip().lower()
@@ -838,7 +841,7 @@ CURATED_PRODUCTS = {
 
 # Product seed list - ALPHABETICAL (no bias, sorted by live scores)
 # Mix of proven dropshipping winners across categories
-PRODUCT_SEEDS = [
+DEFAULT_PRODUCT_SEEDS = [
     # 🏠 Home & Living
     ("air fryer", "Home"),
     ("robot vacuum", "Home"),
@@ -1162,6 +1165,39 @@ SEASONAL_PACKS = [
     },
 ]
 
+# --- Helper: Load seeds from CSV ---
+def load_seeds_from_csv(path: str) -> List[tuple]:
+    """
+    Load seeds from a CSV file with columns: keyword, category.
+    Returns a list of (keyword, category) tuples, deduped and cleaned.
+    """
+    if not path or not os.path.exists(path):
+        return []
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        print(f"[Seeds] Failed to read CSV at {path}: {e}")
+        return []
+    if "keyword" not in df.columns or "category" not in df.columns:
+        print(f"[Seeds] CSV missing required columns 'keyword' and 'category' at {path}")
+        return []
+    # Clean and filter
+    df["keyword"] = df["keyword"].astype(str).str.strip()
+    df["category"] = df["category"].astype(str).str.strip()
+    df = df[(df["keyword"] != "") & (df["category"] != "")]
+    # Deduplicate by (keyword, category) lowercased
+    seen = set()
+    out: List[tuple] = []
+    for _, row in df.iterrows():
+        k = row["keyword"]
+        c = row["category"]
+        key = (k.lower(), c.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((k, c))
+    return out
+
 
 def seasonal_seeds(now: Optional[datetime] = None) -> List[tuple]:
     """Return seasonal seed tuples active for the current month (UTC)."""
@@ -1181,6 +1217,18 @@ def seasonal_seeds(now: Optional[datetime] = None) -> List[tuple]:
             seen.add(key)
             deduped.append((k, c))
     return deduped
+
+# --- Initialize PRODUCT_SEEDS from CSV if available, else use defaults ---
+PRODUCT_SEEDS: List[tuple] = DEFAULT_PRODUCT_SEEDS
+try:
+    _loaded = load_seeds_from_csv(SEEDS_CSV_PATH)
+    if _loaded:
+        PRODUCT_SEEDS = _loaded
+        print(f"[Seeds] Loaded {len(PRODUCT_SEEDS)} seeds from {SEEDS_CSV_PATH}")
+    else:
+        print("[Seeds] Using built-in default seeds")
+except Exception as e:
+    print(f"[Seeds] Error loading CSV seeds, using defaults: {e}")
 
 
 async def update_product_scores_background():
@@ -1331,6 +1379,25 @@ async def get_categories():
             if c:
                 cats.add(c)
     return {"categories": sorted(cats)}
+
+
+# --- Endpoint: reload seeds from CSV ---
+@app.post("/trends/reload-seeds")
+async def reload_seeds():
+    """
+    Reload seeds from SEEDS_CSV_PATH and trigger a background refresh.
+    """
+    global PRODUCT_SEEDS
+    _loaded = load_seeds_from_csv(SEEDS_CSV_PATH)
+    if _loaded:
+        PRODUCT_SEEDS = _loaded
+        msg = f"Reloaded {len(PRODUCT_SEEDS)} seeds from {SEEDS_CSV_PATH}"
+    else:
+        PRODUCT_SEEDS = DEFAULT_PRODUCT_SEEDS
+        msg = "CSV missing/invalid — reverted to built-in defaults"
+    # trigger a background refresh (non-blocking)
+    asyncio.create_task(update_product_scores_background())
+    return {"ok": True, "message": msg, "count": len(PRODUCT_SEEDS)}
 
 
 @app.get("/trends/top-products")
