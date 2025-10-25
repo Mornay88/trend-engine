@@ -147,38 +147,27 @@ class AnalyzeResponse(BaseModel):
 
 
 # ----------------- Demand: Google Trends -----------------
+# ----------------- Demand: Google Trends -----------------
 _pytrends = None
 
-
 def pt() -> TrendReq:
+    """
+    Create a TrendReq without pytrends' internal Retry (retries=0).
+    We'll handle retries ourselves around the calls, which avoids the
+    urllib3 v2 method_whitelist incompatibility.
+    """
     global _pytrends
     if _pytrends is None:
-        # Hardened session with retries and a real UA
         session_args = {
             "headers": {"User-Agent": USER_AGENT},
-            "timeout": (5, 30),  # connect timeout, read timeout
         }
         _pytrends = TrendReq(
             hl="en-US",
             tz=PYTRENDS_TZ,
+            timeout=(5, 30),   # (connect, read)
             requests_args=session_args,
-            retries=Retry(
-                total=3,
-                backoff_factor=0.5,
-                status_forcelist=(429, 500, 502, 503, 504)
-            ),
-        )
-        # Add retry adapter to the underlying session as well
-        s = _pytrends.requests
-        s.mount(
-            "https://",
-            HTTPAdapter(
-                max_retries=Retry(
-                    total=3,
-                    backoff_factor=0.5,
-                    status_forcelist=(429, 500, 502, 503, 504),
-                )
-            ),
+            retries=0,         # IMPORTANT: prevent pytrends from building Retry(method_whitelist=...)
+            backoff_factor=0.0 # ignored when retries=0
         )
     return _pytrends
 
@@ -191,62 +180,70 @@ def fetch_trends(keyword: str, region: str, timeframe: str) -> Dict[str, Any]:
 
     default_out = {"current": 0, "momentum_pct": 0.0, "series": [], "rising_queries": []}
 
-    try:
-        py = pt()
-        geo = "" if region.lower() == "worldwide" else region
-        py.build_payload([keyword], timeframe=timeframe, geo=geo)
-        
-        df = py.interest_over_time()
-        if df is None or df.empty:
-            cache_set(key, default_out)
-            return default_out
+    py = pt()
+    geo = "" if region.lower() == "worldwide" else region
 
-        # Clean dataframe
-        df = df.reset_index()
-        if "isPartial" in df.columns:
-            df = df.drop(columns=["isPartial"])
-        df = df.rename(columns={keyword: "interest", "date": "date"})
-        df["date"] = pd.to_datetime(df["date"]).dt.date
+    # Our own tiny retry loop to replace pytrends' internal Retry
+    attempts = 3
+    backoff = 0.6
 
-        # Calculate momentum (last 90d vs prior 90d) if enough points exist
-        if len(df) >= 180:
-            last = df.tail(90)["interest"].mean()
-            prev = df.tail(180).head(90)["interest"].mean()
-            momentum = ((last - prev) / prev * 100.0) if prev > 0 else 0.0
-        elif len(df) >= 30:
-            last = df.tail(30)["interest"].mean()
-            prev = df.tail(60).head(30)["interest"].mean()
-            momentum = ((last - prev) / prev * 100.0) if prev > 0 else 0.0
-        else:
-            momentum = 0.0
-
-        current = int(df["interest"].iloc[-1])
-        series = [{"t": d.isoformat(), "v": int(v)} for d, v in zip(df["date"], df["interest"])]
-
-        # Rising queries
-        rising: List[str] = []
+    for attempt in range(1, attempts + 1):
         try:
-            rq = py.related_queries() or {}
-            data = rq.get(keyword, {})
-            if data and data.get("rising") is not None and not data["rising"].empty:
-                rising = [str(x) for x in data["rising"]["query"].head(5).tolist()]
+            py.build_payload([keyword], timeframe=timeframe, geo=geo)
+
+            df = py.interest_over_time()
+            if df is None or df.empty:
+                cache_set(key, default_out)
+                return default_out
+
+            df = df.reset_index()
+            if "isPartial" in df.columns:
+                df = df.drop(columns=["isPartial"])
+            df = df.rename(columns={keyword: "interest", "date": "date"})
+            df["date"] = pd.to_datetime(df["date"]).dt.date
+
+            if len(df) >= 180:
+                last = df.tail(90)["interest"].mean()
+                prev = df.tail(180).head(90)["interest"].mean()
+                momentum = ((last - prev) / prev * 100.0) if prev > 0 else 0.0
+            elif len(df) >= 30:
+                last = df.tail(30)["interest"].mean()
+                prev = df.tail(60).head(30)["interest"].mean()
+                momentum = ((last - prev) / prev * 100.0) if prev > 0 else 0.0
+            else:
+                momentum = 0.0
+
+            current = int(df["interest"].iloc[-1])
+            series = [{"t": d.isoformat(), "v": int(v)} for d, v in zip(df["date"], df["interest"])]
+
+            # Rising queries (best-effort; don't fail the whole call)
+            rising: List[str] = []
+            try:
+                rq = py.related_queries() or {}
+                data = rq.get(keyword, {})
+                if data and data.get("rising") is not None and not data["rising"].empty:
+                    rising = [str(x) for x in data["rising"]["query"].head(5).tolist()]
+            except Exception as e:
+                print(f"Rising queries error for '{keyword}': {e}")
+                rising = []
+
+            out = {
+                "current": current,
+                "momentum_pct": float(round(momentum, 2)),
+                "series": series,
+                "rising_queries": rising
+            }
+            cache_set(key, out)
+            return out
+
         except Exception as e:
-            print(f"Rising queries error for '{keyword}': {e}")
-            rising = []
-
-        out = {
-            "current": current,
-            "momentum_pct": float(round(momentum, 2)),
-            "series": series,
-            "rising_queries": rising
-        }
-        cache_set(key, out)
-        return out
-
-    except Exception as e:
-        print(f"Trends fetch error for '{keyword}': {e}")
-        cache_set(key, default_out)
-        return default_out
+            print(f"Trends fetch error (attempt {attempt}/{attempts}) for '{keyword}': {e}")
+            if attempt < attempts:
+                time.sleep(backoff)
+                backoff *= 1.5
+            else:
+                cache_set(key, default_out)
+                return default_out
 
 
 
@@ -829,3 +826,532 @@ async def analyze(body: AnalyzeBody):
         generated_at=datetime.utcnow().isoformat() + "Z",
         cache_ttl_sec=CACHE_TTL_SEC,
     )
+
+# ----------------- Top E-commerce Trends (Global by default) -----------------
+
+# Global storage for curated products with live scores
+CURATED_PRODUCTS = {
+    "last_updated": None,
+    "products": [],
+    "is_updating": False,  # Prevent concurrent updates
+}
+
+# Product seed list - ALPHABETICAL (no bias, sorted by live scores)
+# Mix of proven dropshipping winners across categories
+PRODUCT_SEEDS = [
+    # 🏠 Home & Living
+    ("air fryer", "Home"),
+    ("robot vacuum", "Home"),
+    ("led strip lights", "Home"),
+    ("throw blanket", "Home"),
+    ("diffuser", "Home"),
+    ("humidifier", "Home"),
+    ("essential oil diffuser", "Home"),
+    ("desk organizer", "Home"),
+    ("candle warmer", "Home"),
+    ("storage bins", "Home"),
+    ("wall mirror", "Home"),
+    ("smart plug", "Home"),
+    ("smart light bulb", "Home"),
+    ("air purifier", "Home"),
+    ("electric kettle", "Home"),
+    ("space heater", "Home"),
+    ("dehumidifier", "Home"),
+    ("weighted blanket", "Home"),
+    ("blackout curtains", "Home"),
+    ("cordless vacuum", "Home"),
+    ("standing desk", "Home"),
+    ("monitor light bar", "Home"),
+    ("magnetic window cleaner", "Home"),
+    ("co2 monitor", "Home"),
+    ("robot mop", "Home"),
+
+    # 💪 Fitness & Health
+    ("resistance bands", "Fitness"),
+    ("yoga mat", "Fitness"),
+    ("massage gun", "Fitness"),
+    ("foam roller", "Fitness"),
+    ("adjustable dumbbells", "Fitness"),
+    ("protein shaker", "Fitness"),
+    ("fitness tracker", "Fitness"),
+    ("water bottle", "Fitness"),
+    ("treadmill", "Fitness"),
+    ("exercise bike", "Fitness"),
+    ("rowing machine", "Fitness"),
+    ("ankle weights", "Fitness"),
+    ("pilates ring", "Fitness"),
+    ("door pull up bar", "Fitness"),
+    ("ab roller", "Fitness"),
+
+    # 🧴 Beauty & Personal Care
+    ("facial roller", "Beauty"),
+    ("hair straightener", "Beauty"),
+    ("curling iron", "Beauty"),
+    ("makeup brush set", "Beauty"),
+    ("nail drill", "Beauty"),
+    ("face mask", "Beauty"),
+    ("lip gloss", "Beauty"),
+    ("eyelash curler", "Beauty"),
+    ("hair dryer", "Beauty"),
+    ("electric toothbrush", "Beauty"),
+    ("ice roller", "Beauty"),
+    ("hair waver", "Beauty"),
+    ("laser hair removal", "Beauty"),
+    ("scalp massager", "Beauty"),
+    ("dermaplaning tool", "Beauty"),
+
+    # 🐶 Pets
+    ("dog harness", "Pets"),
+    ("cat tree", "Pets"),
+    ("automatic pet feeder", "Pets"),
+    ("dog bed", "Pets"),
+    ("pet camera", "Pets"),
+    ("cat litter box", "Pets"),
+    ("dog collar", "Pets"),
+    ("pet grooming kit", "Pets"),
+    ("pet stroller", "Pets"),
+    ("interactive cat toy", "Pets"),
+    ("dog car seat", "Pets"),
+    ("slow feeder bowl", "Pets"),
+    ("pet water fountain", "Pets"),
+
+    # 💻 Electronics & Gadgets
+    ("bluetooth speaker", "Electronics"),
+    ("portable charger", "Electronics"),
+    ("power bank", "Electronics"),
+    ("wireless earbuds", "Electronics"),
+    ("smart watch", "Electronics"),
+    ("laptop stand", "Electronics"),
+    ("phone case", "Electronics"),
+    ("ring light", "Electronics"),
+    ("gaming mouse", "Electronics"),
+    ("keyboard", "Electronics"),
+    ("monitor stand", "Electronics"),
+    ("usb hub", "Electronics"),
+    ("tablet stand", "Electronics"),
+    ("action camera", "Electronics"),
+    ("mini projector", "Electronics"),
+    ("bluetooth tracker", "Electronics"),
+    ("car phone holder", "Electronics"),
+    ("magnetic power bank", "Electronics"),
+    ("dash cam", "Electronics"),
+    ("wifi extender", "Electronics"),
+
+    # 👕 Fashion & Accessories
+    ("crossbody bag", "Fashion"),
+    ("sling bag", "Fashion"),
+    ("tote bag", "Fashion"),
+    ("sneakers", "Fashion"),
+    ("hoodie", "Fashion"),
+    ("leggings", "Fashion"),
+    ("watch", "Fashion"),
+    ("sunglasses", "Fashion"),
+    ("hat", "Fashion"),
+    ("jewelry box", "Fashion"),
+    ("wallet", "Fashion"),
+    ("beanie", "Fashion"),
+    ("puffer jacket", "Fashion"),
+    ("ankle boots", "Fashion"),
+    ("thermal socks", "Fashion"),
+
+    # 👶 Baby & Kids
+    ("baby monitor", "Baby"),
+    ("stroller", "Baby"),
+    ("baby carrier", "Baby"),
+    ("diaper bag", "Baby"),
+    ("baby bottle warmer", "Baby"),
+    ("play mat", "Baby"),
+    ("night light", "Baby"),
+    ("crib mobile", "Baby"),
+    ("white noise machine", "Baby"),
+    ("baby lounger", "Baby"),
+
+    # 🍳 Kitchen & Dining
+    ("blender", "Kitchen"),
+    ("coffee grinder", "Kitchen"),
+    ("milk frother", "Kitchen"),
+    ("knife set", "Kitchen"),
+    ("cutting board", "Kitchen"),
+    ("storage jars", "Kitchen"),
+    ("kitchen scale", "Kitchen"),
+    ("toaster oven", "Kitchen"),
+    ("electric griddle", "Kitchen"),
+    ("microwave", "Kitchen"),
+    ("cast iron skillet", "Kitchen"),
+    ("pressure cooker", "Kitchen"),
+    ("immersion blender", "Kitchen"),
+    ("air fryer liners", "Kitchen"),
+    ("electric lunch box", "Kitchen"),
+
+    # 🌿 Outdoors & Travel
+    ("camping lantern", "Outdoors"),
+    ("portable fan", "Outdoors"),
+    ("tent", "Outdoors"),
+    ("cooler bag", "Outdoors"),
+    ("travel pillow", "Outdoors"),
+    ("carry on luggage", "Outdoors"),
+    ("sleeping bag", "Outdoors"),
+    ("solar power bank", "Outdoors"),
+    ("hammock", "Outdoors"),
+    ("beach umbrella", "Outdoors"),
+    ("packing cubes", "Outdoors"),
+    ("inflatable paddle board", "Outdoors"),
+    ("portable power station", "Outdoors"),
+
+    # 🛠️ Home Improvement & Car
+    ("rgb light bulbs", "Home"),
+    ("cordless drill", "Home"),
+    ("laser level", "Home"),
+    ("security camera", "Home"),
+    ("video doorbell", "Home"),
+    ("tire inflator", "Automotive"),
+    ("car vacuum", "Automotive"),
+
+    ("trunk organizer", "Automotive"),
+]
+
+# ---- Seasonal packs (auto-merged based on month) ----
+SEASONAL_PACKS = [
+    # 🎄 Christmas (Nov–Dec)
+    {
+        "months": [11, 12],
+        "seeds": [
+            ("christmas tree", "Seasonal"),
+            ("christmas lights", "Seasonal"),
+            ("advent calendar", "Seasonal"),
+            ("christmas ornaments", "Seasonal"),
+            ("stocking", "Seasonal"),
+            ("gift wrap", "Seasonal"),
+            ("ugly christmas sweater", "Fashion"),
+        ],
+    },
+    # 🎃 Halloween (Sep–Oct)
+    {
+        "months": [9, 10],
+        "seeds": [
+            ("halloween decorations", "Seasonal"),
+            ("halloween costume", "Seasonal"),
+            ("pumpkin carving kit", "Seasonal"),
+            ("spider web decorations", "Seasonal"),
+        ],
+    },
+    # 🦃 Thanksgiving (Nov)
+    {
+        "months": [11],
+        "seeds": [
+            ("thanksgiving decorations", "Seasonal"),
+            ("roasting pan", "Kitchen"),
+            ("meat thermometer", "Kitchen"),
+            ("table runner", "Home"),
+        ],
+    },
+    # 🎆 New Year / Resolutions (Dec–Jan)
+    {
+        "months": [12, 1],
+        "seeds": [
+            ("weekly planner", "Office"),
+            ("habit tracker journal", "Office"),
+            ("water bottle with time marker", "Fitness"),
+            ("jump rope", "Fitness"),
+        ],
+    },
+    # 💘 Valentine’s Day (Jan–Feb)
+    {
+        "months": [1, 2],
+        "seeds": [
+            ("heart necklace", "Fashion"),
+            ("rose bear", "Gifts"),
+            ("chocolate gift box", "Gifts"),
+            ("preserved roses", "Gifts"),
+        ],
+    },
+    # 👩 Mother’s Day (May)
+    {
+        "months": [5],
+        "seeds": [
+            ("jewelry organizer", "Fashion"),
+            ("scented candle", "Home"),
+            ("bath bomb gift set", "Beauty"),
+        ],
+    },
+    # 👨 Father’s Day (June)
+    {
+        "months": [6],
+        "seeds": [
+            ("beard trimmer", "Beauty"),
+            ("whiskey stones", "Kitchen"),
+            ("multitool", "Home"),
+        ],
+    },
+    # 🏫 Back to School (Jul–Sep)
+    {
+        "months": [7, 8, 9],
+        "seeds": [
+            ("backpack", "Fashion"),
+            ("lunch box", "Kitchen"),
+            ("pencil case", "Office"),
+            ("graphing calculator", "Electronics"),
+        ],
+    },
+    # 🌸 Spring Cleaning (Mar–Apr)
+    {
+        "months": [3, 4],
+        "seeds": [
+            ("steam mop", "Home"),
+            ("lint remover", "Home"),
+            ("vacuum storage bags", "Home"),
+        ],
+    },
+    # ☀️ Summer / Outdoors (May–Aug)
+    {
+        "months": [5, 6, 7, 8],
+        "seeds": [
+            ("inflatable pool", "Outdoors"),
+            ("bug zapper", "Outdoors"),
+            ("patio string lights", "Outdoors"),
+        ],
+    },
+]
+
+
+def seasonal_seeds(now: Optional[datetime] = None) -> List[tuple]:
+    """Return seasonal seed tuples active for the current month (UTC)."""
+    if now is None:
+        now = datetime.utcnow()
+    month = now.month
+    out: List[tuple] = []
+    for pack in SEASONAL_PACKS:
+        if month in pack.get("months", []):
+            out.extend(pack.get("seeds", []))
+    # Deduplicate while preserving order
+    seen = set()
+    deduped = []
+    for k, c in out:
+        key = (k.lower(), c)
+        if key not in seen:
+            seen.add(key)
+            deduped.append((k, c))
+    return deduped
+
+
+async def update_product_scores_background():
+    """
+    Background task that updates product scores using real Google Trends data.
+    Uses PyTrends (free) to avoid burning SerpAPI credits.
+    """
+    from datetime import datetime
+    
+    # Prevent concurrent updates
+    if CURATED_PRODUCTS.get("is_updating"):
+        print("[ProductUpdater] Update already in progress, skipping...")
+        return CURATED_PRODUCTS.get("products", [])
+    
+    CURATED_PRODUCTS["is_updating"] = True
+    
+    try:
+        print(f"[ProductUpdater] 🔄 Starting background update at {datetime.utcnow()}")
+
+        region = "US"  # Use US as global proxy
+        timeframe = "today 3-m"  # 3-month trend
+
+        updated_products = []
+
+        active_seeds = PRODUCT_SEEDS + seasonal_seeds()
+        for idx, (keyword, category) in enumerate(active_seeds, 1):
+            try:
+                # Use PyTrends (FREE) - no API credits used
+                demand = fetch_trends(keyword, region, timeframe)
+
+                current = demand.get("current", 0)
+                momentum = demand.get("momentum_pct", 0)
+                rising_count = len(demand.get("rising_queries", []))
+
+                # Calculate opportunity score (0-100)
+                # Formula: Current interest is the main driver
+                base_score = current  # Raw interest (0-100 from Google)
+                momentum_bonus = max(-15, min(momentum * 0.3, 15))  # +/- 15 points max
+                rising_bonus = min(rising_count * 1.5, 10)  # Up to 10 points
+
+                score = max(0, min(100, base_score + momentum_bonus + rising_bonus))
+
+                updated_products.append({
+                    "keyword": keyword,
+                    "category": category,
+                    "score": round(score, 1),
+                    "search_volume": current,
+                    "momentum_pct": round(momentum, 1),
+                    "rising_queries_count": rising_count,
+                })
+
+                print(f"[ProductUpdater] ({idx}/{len(active_seeds)}) {keyword}: score={score:.1f} (vol={current}, mom={momentum:.1f}%, rising={rising_count})")
+
+                # Respect rate limits
+                await asyncio.sleep(PYTRENDS_DELAY_SEC)
+
+            except Exception as e:
+                print(f"[ProductUpdater] ✗ Failed to update '{keyword}': {e}")
+                # Add with zero score so we don't lose the keyword
+                updated_products.append({
+                    "keyword": keyword,
+                    "category": category,
+                    "score": 0,
+                    "search_volume": 0,
+                    "momentum_pct": 0,
+                    "rising_queries_count": 0,
+                })
+                continue
+
+        # Sort by score (HIGHEST FIRST - this is the key!)
+        updated_products.sort(key=lambda x: x["score"], reverse=True)
+
+        # Update global cache
+        CURATED_PRODUCTS["products"] = updated_products
+        CURATED_PRODUCTS["last_updated"] = datetime.utcnow().isoformat() + "Z"
+
+        # Show top 5 for debugging
+        print(f"[ProductUpdater] ✅ Top 5 products by score:")
+        for i, p in enumerate(updated_products[:5], 1):
+            print(f"  {i}. {p['keyword']}: {p['score']}")
+
+        print(f"[ProductUpdater] ✅ Updated {len(updated_products)} products")
+        return updated_products
+
+    finally:
+        CURATED_PRODUCTS["is_updating"] = False
+
+
+async def ensure_products_updated():
+    """
+    Ensure products are updated. If stale (>2 hours) or empty, trigger update.
+    """
+    from datetime import datetime, timedelta
+    
+    last_updated = CURATED_PRODUCTS.get("last_updated")
+    products = CURATED_PRODUCTS.get("products", [])
+    
+    # Check if we need to update
+    needs_update = False
+    
+    if not products:
+        print("[ProductUpdater] No products cached, triggering initial update")
+        needs_update = True
+    elif not last_updated:
+        needs_update = True
+    else:
+        # Parse last update time
+        try:
+            last_update_time = datetime.fromisoformat(last_updated.replace("Z", ""))
+            age = datetime.utcnow() - last_update_time
+            
+            # Update if older than 2 hours
+            if age > timedelta(hours=2):
+                print(f"[ProductUpdater] Data stale ({age.total_seconds()/3600:.1f}h old), updating...")
+                needs_update = True
+        except Exception as e:
+            print(f"[ProductUpdater] Error parsing last_updated: {e}")
+            needs_update = True
+    
+    if needs_update:
+        # Trigger background update (non-blocking)
+        asyncio.create_task(update_product_scores_background())
+        
+        # If we have stale data, return it immediately while updating in background
+        if products:
+            print("[ProductUpdater] Returning stale data while updating in background")
+            return products
+        else:
+            # First time: wait for update to complete
+            print("[ProductUpdater] First run: waiting for update to complete...")
+            return await update_product_scores_background()
+    
+    return products
+
+
+@app.get("/trends/top-products")
+async def get_top_products(geo: str = "GLOBAL", limit: int = 10):
+    """
+    Returns top trending e-commerce products with LIVE scores.
+    Scores auto-update every 2 hours using Google Trends (FREE - no API credits).
+    
+    Data sources:
+    - Google Trends (PyTrends) - FREE, updates every 2 hours
+    - Curated product list - manually maintained
+    
+    Scoring formula:
+    - Base: Current search interest (0-100)
+    - Momentum: +/- 20 points based on 3-month trend
+    - Rising queries: +10 points max for trending related searches
+    """
+    from datetime import datetime
+
+    # Clamp limit
+    try:
+        limit = max(1, min(int(limit), 25))
+    except Exception:
+        limit = 10
+
+    # Get products (will auto-update if stale)
+    products = await ensure_products_updated()
+    
+    # If still no products (first run failed), return empty
+    if not products:
+        return {
+            "geo": geo.upper(),
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+            "items": [],
+            "last_data_update": None,
+            "next_update": "In progress...",
+            "error": "Product data is being fetched for the first time. Please try again in 30 seconds."
+        }
+    
+    # Take top N
+    items = []
+    for idx, product in enumerate(products[:limit], start=1):
+        items.append({
+            "rank": idx,
+            "keyword": product["keyword"],
+            "category": product["category"],
+            "opportunity_score": product["score"],
+            "search_volume": product.get("search_volume", 0),
+            "momentum_pct": product.get("momentum_pct", 0),
+            "source": "live_google_trends",
+        })
+
+    # Calculate next update time
+    last_updated = CURATED_PRODUCTS.get("last_updated")
+    next_update = "Within 2 hours"
+    if last_updated:
+        try:
+            from datetime import datetime, timedelta
+            last_time = datetime.fromisoformat(last_updated.replace("Z", ""))
+            next_time = last_time + timedelta(hours=2)
+            next_update = next_time.isoformat() + "Z"
+        except Exception:
+            pass
+
+    result = {
+        "geo": geo.upper(),
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+        "items": items,
+        "last_data_update": last_updated,
+        "next_update": next_update,
+        "note": "Scores auto-update every 2 hours using Google Trends (FREE). No API credits used."
+    }
+    
+    return result
+
+
+@app.get("/trends/refresh")
+async def force_refresh_products():
+    """
+    Admin endpoint to manually trigger a product score refresh.
+    Useful for testing or forcing an update outside the 2-hour window.
+    """
+    print("[ProductUpdater] Manual refresh triggered")
+    products = await update_product_scores_background()
+    
+    return {
+        "status": "success",
+        "updated_count": len(products),
+        "updated_at": CURATED_PRODUCTS.get("last_updated"),
+    }
