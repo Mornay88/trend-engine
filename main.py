@@ -937,6 +937,18 @@ PRODUCT_SEEDS = [
     ("dash cam", "Electronics"),
     ("wifi extender", "Electronics"),
 
+    # 🗂️ Office / Home Office
+    ("laptop riser", "Office"),
+    ("ergonomic mouse", "Office"),
+    ("mechanical keyboard", "Office"),
+    ("monitor riser", "Office"),
+    ("desk pad", "Office"),
+    ("cable management box", "Office"),
+    ("document holder", "Office"),
+    ("whiteboard", "Office"),
+    ("standing desk mat", "Office"),
+    ("office chair cushion", "Office"),
+
     # 👕 Fashion & Accessories
     ("crossbody bag", "Fashion"),
     ("sling bag", "Fashion"),
@@ -953,6 +965,14 @@ PRODUCT_SEEDS = [
     ("puffer jacket", "Fashion"),
     ("ankle boots", "Fashion"),
     ("thermal socks", "Fashion"),
+
+    # 🎁 Gifts (evergreen)
+    ("gift basket", "Gifts"),
+    ("personalized necklace", "Gifts"),
+    ("whiskey decanter set", "Gifts"),
+    ("spa gift set", "Gifts"),
+    ("coffee gift set", "Gifts"),
+    ("custom photo frame", "Gifts"),
 
     # 👶 Baby & Kids
     ("baby monitor", "Baby"),
@@ -1006,8 +1026,17 @@ PRODUCT_SEEDS = [
     ("video doorbell", "Home"),
     ("tire inflator", "Automotive"),
     ("car vacuum", "Automotive"),
-
     ("trunk organizer", "Automotive"),
+    ("sun shade", "Automotive"),
+    ("windshield cover", "Automotive"),
+    ("phone mount for car", "Automotive"),
+    ("car seat covers", "Automotive"),
+    ("led interior car lights", "Automotive"),
+    ("tire pressure gauge", "Automotive"),
+    ("car trash can", "Automotive"),
+    ("portable jump starter", "Automotive"),
+    ("roof cargo bag", "Automotive"),
+    ("snow brush", "Automotive"),
 ]
 
 # ---- Seasonal packs (auto-merged based on month) ----
@@ -1100,6 +1129,8 @@ SEASONAL_PACKS = [
             ("steam mop", "Home"),
             ("lint remover", "Home"),
             ("vacuum storage bags", "Home"),
+            ("gardening tools", "Seasonal"),
+            ("seed starter kit", "Seasonal"),
         ],
     },
     # ☀️ Summer / Outdoors (May–Aug)
@@ -1109,6 +1140,24 @@ SEASONAL_PACKS = [
             ("inflatable pool", "Outdoors"),
             ("bug zapper", "Outdoors"),
             ("patio string lights", "Outdoors"),
+            ("cooling towel", "Seasonal"),
+            ("picnic blanket", "Seasonal"),
+        ],
+    },
+    # 🍂 Fall (Sep–Nov)
+    {
+        "months": [9, 10, 11],
+        "seeds": [
+            ("heated blanket", "Seasonal"),
+            ("fall wreath", "Seasonal"),
+        ],
+    },
+    # ❄️ Winter (Dec–Feb)
+    {
+        "months": [12, 1, 2],
+        "seeds": [
+            ("hand warmers", "Seasonal"),
+            ("snow shovel", "Seasonal"),
         ],
     },
 ]
@@ -1267,11 +1316,28 @@ async def ensure_products_updated():
     return products
 
 
+
+@app.get("/trends/categories")
+async def get_categories():
+    # Prefer currently computed products; if empty, derive from seeds + seasonal
+    cats = set()
+    if CURATED_PRODUCTS.get("products"):
+        for p in CURATED_PRODUCTS["products"]:
+            c = str(p.get("category", "")).strip()
+            if c:
+                cats.add(c)
+    else:
+        for _, c in PRODUCT_SEEDS + seasonal_seeds():
+            if c:
+                cats.add(c)
+    return {"categories": sorted(cats)}
+
+
 @app.get("/trends/top-products")
-async def get_top_products(geo: str = "GLOBAL", limit: int = 10):
+async def get_top_products(geo: str = "GLOBAL", limit: int = 10, category: Optional[str] = None):
     """
     Returns top trending e-commerce products with LIVE scores.
-    Scores auto-update every 2 hours using Google Trends (FREE - no API credits).
+    Scores auto-update every 2 hours.
     
     Data sources:
     - Google Trends (PyTrends) - FREE, updates every 2 hours
@@ -1303,6 +1369,12 @@ async def get_top_products(geo: str = "GLOBAL", limit: int = 10):
             "next_update": "In progress...",
             "error": "Product data is being fetched for the first time. Please try again in 30 seconds."
         }
+
+    # Optional category filter (case-insensitive). Accepts "all" or empty as no filter.
+    if category:
+        cat_norm = category.strip().lower()
+        if cat_norm not in ("", "all"):
+            products = [p for p in products if str(p.get("category", "")).strip().lower() == cat_norm]
     
     # Take top N
     items = []
@@ -1331,11 +1403,12 @@ async def get_top_products(geo: str = "GLOBAL", limit: int = 10):
 
     result = {
         "geo": geo.upper(),
+        "category": (category or "ALL").upper(),
         "updated_at": datetime.utcnow().isoformat() + "Z",
         "items": items,
         "last_data_update": last_updated,
         "next_update": next_update,
-        "note": "Scores auto-update every 2 hours using Google Trends (FREE). No API credits used."
+        "note": "Scores auto-update every 2 hours."
     }
     
     return result
