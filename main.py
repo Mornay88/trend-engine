@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
+import random
 import time
 import re
 import asyncio
@@ -33,6 +34,12 @@ DEFAULT_TIMEFRAME = os.environ.get("DEFAULT_TIMEFRAME", "today 5-y")
 HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "30"))
 # PYTRENDS_DELAY_SEC: How long to wait between Google Trends requests (PyTrends)
 PYTRENDS_DELAY_SEC = float(os.environ.get("PYTRENDS_DELAY_SEC", "2.0"))
+# Batch size for batched Google Trends requests (PyTrends)
+PYTRENDS_BATCH_SIZE = int(os.environ.get("PYTRENDS_BATCH_SIZE", "5"))
+# Jitter (random delay) added to each batch sleep, in seconds
+PYTRENDS_JITTER_SEC = float(os.environ.get("PYTRENDS_JITTER_SEC", "0.5"))
+# Maximum backoff cap for PyTrends retry
+PYTRENDS_MAX_BACKOFF_SEC = float(os.environ.get("PYTRENDS_MAX_BACKOFF_SEC", "60"))
 # Optional debug logging flag for quieter logs in production
 DEBUG_LOGS = (os.environ.get("DEBUG_LOGS", "false").strip().lower() in ("1", "true", "yes"))
 def log(msg: str):
@@ -249,6 +256,96 @@ def fetch_trends(keyword: str, region: str, timeframe: str, nocache: bool = Fals
             else:
                 cache_set(key, default_out)
                 return default_out
+
+
+# --------- Batch Google Trends helper ---------
+def fetch_trends_batch(keywords: List[str], region: str, timeframe: str, nocache: bool = False) -> Dict[str, Dict[str, Any]]:
+    """
+    Fetch Google Trends for a list of keywords in a single PyTrends request.
+    Returns a dict mapping keyword to demand dict.
+    """
+    py = pt()
+    geo = "" if region.lower() == "worldwide" else region
+    default_out = {"current": 0, "momentum_pct": 0.0, "series": [], "rising_queries": []}
+    # Try to fetch from cache first if nocache is False
+    cache_keys = {kw: make_cache_key("trends", kw, region, timeframe) for kw in keywords}
+    cached: Dict[str, Dict[str, Any]] = {}
+    if not nocache:
+        for kw, ck in cache_keys.items():
+            hit = cache_get(ck)
+            if hit:
+                cached[kw] = hit
+    # If all keywords are cached, return immediately
+    if len(cached) == len(keywords):
+        return dict(cached)
+
+    # Only fetch keywords not in cache
+    to_fetch = [kw for kw in keywords if kw not in cached]
+    results: Dict[str, Dict[str, Any]] = {}
+    attempts = 3
+    backoff = 0.6
+    for attempt in range(1, attempts + 1):
+        try:
+            py.build_payload(to_fetch, timeframe=timeframe, geo=geo)
+            df = py.interest_over_time()
+            if df is None or df.empty:
+                # If no data, fill all with default
+                for kw in to_fetch:
+                    results[kw] = dict(default_out)
+                break
+            df = df.reset_index()
+            if "isPartial" in df.columns:
+                df = df.drop(columns=["isPartial"])
+            # Ensure all to_fetch columns exist
+            for kw in to_fetch:
+                if kw not in df.columns:
+                    results[kw] = dict(default_out)
+                    continue
+                # Prepare single-keyword DataFrame
+                dfi = pd.DataFrame({"date": df["date"], "interest": df[kw]})
+                dfi["date"] = pd.to_datetime(dfi["date"]).dt.date
+                n = len(dfi)
+                if n >= 180:
+                    last = dfi.tail(90)["interest"].mean()
+                    prev = dfi.tail(180).head(90)["interest"].mean()
+                    momentum = ((last - prev) / prev * 100.0) if prev > 0 else 0.0
+                elif n >= 30:
+                    last = dfi.tail(30)["interest"].mean()
+                    prev = dfi.tail(60).head(30)["interest"].mean()
+                    momentum = ((last - prev) / prev * 100.0) if prev > 0 else 0.0
+                else:
+                    momentum = 0.0
+                current = int(dfi["interest"].iloc[-1])
+                series = [{"t": d.isoformat(), "v": int(v)} for d, v in zip(dfi["date"], dfi["interest"])]
+                # Do not call related_queries in batch mode
+                rising = []
+                out = {
+                    "current": current,
+                    "momentum_pct": float(round(momentum, 2)),
+                    "series": series,
+                    "rising_queries": rising,
+                }
+                results[kw] = out
+            break
+        except Exception as e:
+            print(f"Trends batch fetch error (attempt {attempt}/{attempts}) for {to_fetch}: {e}")
+            if attempt < attempts:
+                time.sleep(backoff)
+                backoff = min(backoff * 1.5, PYTRENDS_MAX_BACKOFF_SEC)
+            else:
+                for kw in to_fetch:
+                    results[kw] = dict(default_out)
+    # Cache results for each keyword
+    for kw in to_fetch:
+        cache_set(cache_keys[kw], results[kw])
+    # Merge with any cached
+    out: Dict[str, Dict[str, Any]] = dict(cached)
+    out.update(results)
+    # If any missing, fill with default
+    for kw in keywords:
+        if kw not in out:
+            out[kw] = dict(default_out)
+    return out
 
 
 
@@ -1237,16 +1334,16 @@ async def update_product_scores_background():
     """
     Background task that updates product scores using real Google Trends data.
     Uses PyTrends (free) to avoid burning SerpAPI credits.
+    Now uses batched requests for efficiency.
     """
     from datetime import datetime
-    
+
     # Prevent concurrent updates
     if CURATED_PRODUCTS.get("is_updating"):
         print("[ProductUpdater] Update already in progress, skipping...")
         return CURATED_PRODUCTS.get("products", [])
-    
+
     CURATED_PRODUCTS["is_updating"] = True
-    
     try:
         print(f"[ProductUpdater] 🔄 Starting background update at {datetime.utcnow()}")
 
@@ -1254,25 +1351,28 @@ async def update_product_scores_background():
         timeframe = "today 3-m"  # 3-month trend
 
         updated_products = []
-
         active_seeds = PRODUCT_SEEDS + seasonal_seeds()
-        for idx, (keyword, category) in enumerate(active_seeds, 1):
+        n_total = len(active_seeds)
+        batch_size = PYTRENDS_BATCH_SIZE
+        # Prepare batches
+        for batch_start in range(0, n_total, batch_size):
+            batch = active_seeds[batch_start:batch_start + batch_size]
+            kw_batch = [k for (k, _) in batch]
             try:
-                # Use PyTrends (FREE) - no API credits used
-                demand = fetch_trends(keyword, region, timeframe, nocache=True)
-
+                batch_demands = fetch_trends_batch(kw_batch, region, timeframe, nocache=True)
+            except Exception as e:
+                print(f"[ProductUpdater] ✗ Batch fetch failed for {kw_batch}: {e}")
+                batch_demands = {}
+            for i, (keyword, category) in enumerate(batch):
+                demand = batch_demands.get(keyword) or {"current": 0, "momentum_pct": 0.0, "series": [], "rising_queries": []}
                 current = demand.get("current", 0)
                 momentum = demand.get("momentum_pct", 0)
                 rising_count = len(demand.get("rising_queries", []))
-
                 # Calculate opportunity score (0-100)
-                # Formula: Current interest is the main driver
                 base_score = current  # Raw interest (0-100 from Google)
                 momentum_bonus = max(-15, min(momentum * 0.3, 15))  # +/- 15 points max
                 rising_bonus = min(rising_count * 1.5, 10)  # Up to 10 points
-
                 score = max(0, min(100, base_score + momentum_bonus + rising_bonus))
-
                 updated_products.append({
                     "keyword": keyword,
                     "category": category,
@@ -1281,24 +1381,10 @@ async def update_product_scores_background():
                     "momentum_pct": round(momentum, 1),
                     "rising_queries_count": rising_count,
                 })
-
-                print(f"[ProductUpdater] ({idx}/{len(active_seeds)}) {keyword}: score={score:.1f} (vol={current}, mom={momentum:.1f}%, rising={rising_count})")
-
-                # Respect rate limits
-                await asyncio.sleep(PYTRENDS_DELAY_SEC)
-
-            except Exception as e:
-                print(f"[ProductUpdater] ✗ Failed to update '{keyword}': {e}")
-                # Add with zero score so we don't lose the keyword
-                updated_products.append({
-                    "keyword": keyword,
-                    "category": category,
-                    "score": 0,
-                    "search_volume": 0,
-                    "momentum_pct": 0,
-                    "rising_queries_count": 0,
-                })
-                continue
+                overall_idx = batch_start + i + 1
+                print(f"[ProductUpdater] ({overall_idx}/{n_total}) {keyword}: score={score:.1f} (vol={current}, mom={momentum:.1f}%, rising={rising_count})")
+            # Respect rate limits with jitter
+            await asyncio.sleep(PYTRENDS_DELAY_SEC + random.uniform(0, PYTRENDS_JITTER_SEC))
 
         # Sort by score (HIGHEST FIRST - this is the key!)
         updated_products.sort(key=lambda x: x["score"], reverse=True)
@@ -1314,7 +1400,6 @@ async def update_product_scores_background():
 
         print(f"[ProductUpdater] ✅ Updated {len(updated_products)} products")
         return updated_products
-
     finally:
         CURATED_PRODUCTS["is_updating"] = False
 
