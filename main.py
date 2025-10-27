@@ -175,11 +175,13 @@ def pt() -> TrendReq:
     return _pytrends
 
 
-def fetch_trends(keyword: str, region: str, timeframe: str) -> Dict[str, Any]:
+def fetch_trends(keyword: str, region: str, timeframe: str, nocache: bool = False) -> Dict[str, Any]:
     key = make_cache_key("trends", keyword, region, timeframe)
-    hit = cache_get(key)
-    if hit:
-        return hit
+    hit = None
+    if not nocache:
+        hit = cache_get(key)
+        if hit:
+            return hit
 
     default_out = {"current": 0, "momentum_pct": 0.0, "series": [], "rising_queries": []}
 
@@ -1257,7 +1259,7 @@ async def update_product_scores_background():
         for idx, (keyword, category) in enumerate(active_seeds, 1):
             try:
                 # Use PyTrends (FREE) - no API credits used
-                demand = fetch_trends(keyword, region, timeframe)
+                demand = fetch_trends(keyword, region, timeframe, nocache=True)
 
                 current = demand.get("current", 0)
                 momentum = demand.get("momentum_pct", 0)
